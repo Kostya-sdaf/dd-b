@@ -1,50 +1,63 @@
 """
-Duel Duck — Telegram Duel Idea Generator Bot
+Duel Duck — Telegram Duel Idea Generator Bot (v2 — Sorsa API)
 
-Setup:
-  1. pip install python-telegram-bot anthropic
-  2. Create .env or export vars:
-       TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-       ANTHROPIC_API_KEY=your_anthropic_api_key
-  3. python bot.py
+Flow:
+  /duel → Twitter handle → Sorsa fetches tweets (last 2 days)
+  → Claude Haiku generates duels → buttons with full create-duel params
 
-Usage:
-  - Send a Twitter/X link or @handle to the bot
-  - Bot analyzes recent tweets and returns "Will ..." duel ideas
-  - Each idea has a "Create Duel" button linking to duelduck.com
+Hardcoded: 2 USDC ticket, +10h UTC deadline, 5% commission
 """
 
 import os
 import re
 import json
 import logging
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode
+
+import requests as http_requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 from anthropic import Anthropic
 
+# ── State ─────────────────────────────────────────────────────────
+ASK_HANDLE = 0
+
 # ── Config ────────────────────────────────────────────────────────
-
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")  # optional if set globally
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+SORSA_API_KEY = os.environ["SORSA_API_KEY"]
 
-# Change this to your actual duel creation URL/route
-DUEL_CREATE_URL = "https://duelduck.com/create-duel?title="
+SORSA_BASE = "https://api.sorsa.io/v3"
+DUEL_BASE_URL = "https://duelduck.com/create-duel"
+
+# ── Duel defaults ─────────────────────────────────────────────────
+DUEL_SYMBOL = "USDC"
+DUEL_PRICE = 2
+DUEL_COMMISSION = 5
+DUEL_DEADLINE_HOURS = 10
 
 SYSTEM_PROMPT = """You are a Duel Duck duel idea generator. Duel Duck is a PvP predictions platform on Solana where users create yes/no prediction duels.
 
-You will receive recent tweets/context about a Twitter account. Generate 4-5 creative duel ideas that start with "Will..." and relate to the account's recent activity.
+You will receive the latest tweets (last 2 days) from a Twitter account with full text and engagement metrics. Generate 4-5 creative duel ideas that start with "Will..." and relate directly to those tweets.
 
 Rules:
 - Every duel MUST start with "Will"
 - Duels must be yes/no answerable
 - Keep them short (under 120 chars)
-- Make them specific to the account's recent tweets, announcements, metrics, or claims
+- Make them specific to the actual tweet content — reference real numbers, claims, announcements, or events
 - Be creative — price predictions, milestones, shipping deadlines, community reactions
-- No generic duels — every idea must clearly connect to something the account posted
+- No generic duels — every idea must clearly connect to something from the tweets
 
-Respond ONLY with a JSON array, no markdown, no backticks. Each object:
-- "duel": the full duel question starting with "Will"
-- "context": one short sentence explaining which tweet/topic inspired this (max 80 chars)
+CRITICAL: Respond ONLY with a JSON array. No markdown, no backticks, no extra text.
+Each object: {"duel": "Will ...", "context": "short explanation (max 80 chars)"}
 
 Example:
 [{"duel":"Will @example hit 100k followers before July?","context":"They tweeted about rapid follower growth"}]"""
@@ -55,127 +68,243 @@ logger = logging.getLogger(__name__)
 client = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else Anthropic()
 
 
+# ── Sorsa API ─────────────────────────────────────────────────────
+
+def fetch_recent_tweets(username: str, max_tweets: int = 20) -> tuple[list[dict] | None, str]:
+    """Fetch tweets (last 2 days) + avatar from Sorsa. Returns (tweets, avatar_url)."""
+    try:
+        resp = http_requests.post(
+            f"{SORSA_BASE}/user-tweets",
+            headers={"ApiKey": SORSA_API_KEY},
+            json={"username": username, "limit": max_tweets},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        tweets_raw = data.get("tweets", [])
+        if not tweets_raw:
+            return None, ""
+
+        # Avatar from first tweet's user object
+        avatar = tweets_raw[0].get("user", {}).get("profile_image_url", "")
+        if avatar:
+            avatar = avatar.replace("_normal.", "_400x400.")
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+        result = []
+
+        for t in tweets_raw:
+            date_str = t.get("created_at", "")
+            tweet_dt = None
+            for fmt in (
+                "%a %b %d %H:%M:%S %z %Y",
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%d %H:%M:%S",
+            ):
+                try:
+                    tweet_dt = datetime.strptime(date_str, fmt)
+                    if tweet_dt.tzinfo is None:
+                        tweet_dt = tweet_dt.replace(tzinfo=timezone.utc)
+                    break
+                except (ValueError, TypeError):
+                    continue
+
+            if tweet_dt and tweet_dt < cutoff:
+                continue
+
+            result.append({
+                "text": t.get("full_text") or t.get("text", ""),
+                "likes": t.get("likes_count", 0),
+                "retweets": t.get("retweet_count", 0),
+                "replies": t.get("reply_count", 0),
+                "views": t.get("view_count", 0),
+                "date": date_str,
+            })
+
+        return (result if result else None), avatar
+
+    except Exception:
+        logger.exception(f"Sorsa /user-tweets error for @{username}")
+        return None, ""
+
+
 # ── Helpers ───────────────────────────────────────────────────────
 
 def extract_handle(text: str) -> str | None:
-    """Extract Twitter handle from a link or @mention."""
     text = text.strip().rstrip("/")
-    # URL pattern
     m = re.search(r"(?:twitter\.com|x\.com)/(@?[\w]+)", text, re.I)
     if m:
         return m.group(1).lstrip("@")
-    # Plain @handle or handle
     m = re.match(r"^@?([\w]{1,15})$", text)
     if m:
         return m.group(1)
     return None
 
 
-def encode_duel_url(duel_text: str) -> str:
-    from urllib.parse import quote
-    return DUEL_CREATE_URL + quote(duel_text, safe="")
+def build_duel_url(question: str, image_url: str = "") -> str:
+    """Build create-duel URL with all required params."""
+    deadline = datetime.now(timezone.utc) + timedelta(hours=DUEL_DEADLINE_HOURS)
+    deadline_iso = deadline.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    params = {
+        "symbol": DUEL_SYMBOL,
+        "topic": "custom",
+        "question": question,
+        "deadline": deadline_iso,
+        "duel_price": DUEL_PRICE,
+        "commission": DUEL_COMMISSION,
+        "is_owner_resolving": "true",
+        "answer": 0,
+        "event_date": deadline_iso,
+    }
+    if image_url:
+        params["image_url"] = image_url
+
+    return f"{DUEL_BASE_URL}?{urlencode(params)}"
+
+
+def format_tweets_for_prompt(username: str, tweets: list[dict]) -> str:
+    lines = [f"Latest tweets from @{username} (last 2 days):\n"]
+    for i, t in enumerate(tweets, 1):
+        lines.append(f"Tweet {i} ({t['date']}):")
+        lines.append(f"  \"{t['text']}\"")
+        lines.append(
+            f"  {t['likes']} likes, {t['retweets']} RTs, "
+            f"{t['replies']} replies, {t['views']} views"
+        )
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ── Bot handlers ──────────────────────────────────────────────────
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_duel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🦆 *Duel Duck Idea Generator*\n\n"
-        "Send me a Twitter/X link or @handle — "
-        "I'll analyze recent tweets and suggest duel ideas.\n\n"
-        "Example: `@solana` or `https://x.com/solana`",
+        "📎 Надішли Twitter/X хендл або посилання:\n"
+        "Приклад: `@solana` або `https://x.com/solana`",
         parse_mode="Markdown",
     )
+    return ASK_HANDLE
 
 
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    handle = extract_handle(text)
-
+async def received_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    handle = extract_handle(update.message.text or "")
     if not handle:
         await update.message.reply_text(
-            "Send me a Twitter/X link or @handle to get started."
+            "❌ Не розпізнав хендл. Спробуй ще: @handle або посилання."
         )
-        return
+        return ASK_HANDLE
 
     status = await update.message.reply_text(
-        f"🔍 Scanning @{handle}'s tweets..."
+        f"🔍 Завантажую твіти @{handle} за останні 2 дні..."
     )
 
+    # ── Fetch tweets + avatar (one API call) ──────────────────────
+    tweets, avatar_url = fetch_recent_tweets(handle)
+    if not tweets:
+        await status.edit_text(
+            f"❌ Не знайшов свіжих твітів (за 2 дні) для @{handle}.\n"
+            "Спробуй інший акаунт або /duel заново."
+        )
+        return ConversationHandler.END
+
+    await status.edit_text(
+        f"🎯 {len(tweets)} твітів знайдено. Генерую дуелі..."
+    )
+
+    # ── Generate duels via Claude Haiku ───────────────────────────
+    tweet_context = format_tweets_for_prompt(handle, tweets)
+
     try:
-        # Single API call: search tweets + generate duels
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2048,
             system=SYSTEM_PROMPT,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Search for the latest tweets from @{handle} on Twitter/X. "
-                        f"Then generate 4-5 duel ideas based on what you find."
-                    ),
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"{tweet_context}\n\n"
+                    f"Generate 4-5 duel ideas based on these tweets."
+                ),
+            }],
         )
 
-        await status.edit_text(f"🎯 Generating duels for @{handle}...")
+        raw = "".join(b.text for b in resp.content if b.type == "text")
+        logger.info(f"Raw: {raw[:500]}")
 
-        raw = "".join(
-            b.text for b in resp.content if b.type == "text"
-        )
-        logger.info(f"Raw response: {raw[:500]}")
         cleaned = re.sub(r"```json|```", "", raw).strip()
         match = re.search(r"\[.*\]", cleaned, re.DOTALL)
         if not match:
-            await status.edit_text(f"Couldn't parse response. Raw:\n{raw[:300]}")
-            return
+            await status.edit_text("❌ Не вдалося розпарсити відповідь.")
+            return ConversationHandler.END
+
         ideas = json.loads(match.group())
-
         if not ideas:
-            await status.edit_text("No ideas generated. Try a different account.")
-            return
+            await status.edit_text("❌ Ідей не згенеровано. /duel")
+            return ConversationHandler.END
 
-        # Send each idea as a message with a button
+        # ── Send results ──────────────────────────────────────────
+        deadline_display = (
+            datetime.now(timezone.utc) + timedelta(hours=DUEL_DEADLINE_HOURS)
+        ).strftime("%H:%M UTC")
+
         await status.edit_text(
-            f"🦆 *Duel ideas for @{handle}:*",
+            f"🦆 *Дуелі для @{handle}*\n"
+            f"💰 {DUEL_PRICE} {DUEL_SYMBOL} · ⏰ дедлайн ~{deadline_display}",
             parse_mode="Markdown",
         )
 
         for idea in ideas:
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "🎯 Create Duel",
-                            url=encode_duel_url(idea["duel"]),
-                        )
-                    ]
-                ]
-            )
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"🎯 Create Duel ({DUEL_PRICE} {DUEL_SYMBOL})",
+                    url=build_duel_url(idea["duel"], avatar_url),
+                )
+            ]])
             await update.message.reply_text(
                 f"*{idea['duel']}*\n_{idea.get('context', '')}_",
                 parse_mode="Markdown",
                 reply_markup=keyboard,
             )
 
+        await update.message.reply_text("Ще дуелі? /duel 🦆")
+
     except json.JSONDecodeError:
-        logger.exception("Failed to parse ideas JSON")
-        await status.edit_text("Failed to parse duel ideas. Try again.")
+        logger.exception("JSON parse error")
+        await status.edit_text("❌ Помилка парсингу. /duel")
     except Exception as e:
         logger.exception("Error generating duels")
-        await status.edit_text(f"Something went wrong: {e}")
+        await status.edit_text(f"❌ Помилка: {e}")
+
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Скасовано. /duel")
+    return ConversationHandler.END
 
 
 # ── Main ──────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot started")
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", cmd_duel),
+            CommandHandler("duel", cmd_duel),
+        ],
+        states={
+            ASK_HANDLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_handle)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(conv)
+    logger.info("Bot started (v2 — Sorsa API, 2 USDC, +10h deadline)")
     app.run_polling()
 
 
