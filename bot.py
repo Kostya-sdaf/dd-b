@@ -1,16 +1,18 @@
 """
-Duel Duck — Telegram Duel Idea Generator Bot (v2 — Sorsa API)
+Duel Duck — Telegram Duel Idea Generator Bot (v3 — Full API Integration)
 
 Flow:
   /duel → Twitter handle → Sorsa fetches tweets (last 2 days)
-  → Claude Haiku generates duels → buttons with full create-duel params
+  → Claude Haiku generates duels → creates duels via DuelDuck API
+  → returns links to live duels
 
-Hardcoded: 2 USDC ticket, +10h UTC deadline, 5% commission
+Hardcoded: 2 USDC ticket, +10h UTC deadline, 5% commission, platform resolves
 """
 
 import os
 import re
 import json
+import io
 import logging
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
@@ -34,9 +36,11 @@ ASK_HANDLE = 0
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SORSA_API_KEY = os.environ["SORSA_API_KEY"]
+DUELDUCK_REFRESH_TOKEN = os.environ["DUELDUCK_REFRESH_TOKEN"]
 
 SORSA_BASE = "https://api.sorsa.io/v3"
-DUEL_BASE_URL = "https://duelduck.com/create-duel"
+DD_API_BASE = "https://xapi.duelduck.com"
+DD_SITE_BASE = "https://duelduck.com"
 
 # ── Duel defaults ─────────────────────────────────────────────────
 DUEL_SYMBOL = "USDC"
@@ -67,6 +71,123 @@ logger = logging.getLogger(__name__)
 
 client = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else Anthropic()
 
+# ── DuelDuck Auth ─────────────────────────────────────────────────
+
+_tokens = {
+    "access_token": None,
+    "refresh_token": DUELDUCK_REFRESH_TOKEN,
+}
+
+
+def dd_get_access_token() -> str | None:
+    """Refresh JWT tokens and return a valid access_token."""
+    try:
+        resp = http_requests.post(
+            f"{DD_API_BASE}/auth/refresh",
+            headers={"Authorization": f"Bearer {_tokens['refresh_token']}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        jwt = data.get("jwt_info", {})
+        _tokens["access_token"] = jwt.get("access_token")
+        _tokens["refresh_token"] = jwt.get("refresh_token", _tokens["refresh_token"])
+        logger.info("DuelDuck tokens refreshed")
+        return _tokens["access_token"]
+    except Exception:
+        logger.exception("Failed to refresh DuelDuck token")
+        return None
+
+
+def dd_auth_headers() -> dict:
+    """Get Authorization headers, refreshing token if needed."""
+    token = _tokens["access_token"] or dd_get_access_token()
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+# ── DuelDuck API ──────────────────────────────────────────────────
+
+def dd_upload_avatar(image_url: str) -> str | None:
+    """Download avatar from Twitter and upload to DuelDuck. Returns logo_url."""
+    try:
+        # Download image
+        img_resp = http_requests.get(image_url, timeout=10)
+        img_resp.raise_for_status()
+
+        # Upload to DuelDuck
+        token = _tokens["access_token"] or dd_get_access_token()
+        resp = http_requests.get(
+            f"{DD_API_BASE}/admin/duel/upload-image",
+            headers={"Authorization": f"Bearer {token}"},
+            files={"duel_logo": ("avatar.jpg", io.BytesIO(img_resp.content), "image/jpeg")},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Response is a dict with the URL somewhere
+        logo_url = data.get("duel_logo_url") or data.get("url") or ""
+        if not logo_url:
+            # Try to find any string value that looks like a URL
+            for v in data.values():
+                if isinstance(v, str) and v.startswith("http"):
+                    logo_url = v
+                    break
+        logger.info(f"Avatar uploaded: {logo_url}")
+        return logo_url
+    except Exception:
+        logger.exception("Failed to upload avatar")
+        return None
+
+
+def dd_create_duel(question: str, logo_url: str = "") -> dict | None:
+    """Create a duel via POST /admin/duel. Returns duel data or None."""
+    deadline = datetime.now(timezone.utc) + timedelta(hours=DUEL_DEADLINE_HOURS)
+    deadline_iso = deadline.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    body = {
+        "question": question,
+        "symbol": DUEL_SYMBOL,
+        "duel_price": DUEL_PRICE,
+        "commission_rate": DUEL_COMMISSION,
+        "deadline": deadline_iso,
+        "is_owner_resolving": False,
+        "answer": 0,
+        "source_of_truth": "",
+        "duel_info": {},
+    }
+    if logo_url:
+        body["logo_url"] = logo_url
+
+    headers = dd_auth_headers()
+
+    try:
+        resp = http_requests.post(
+            f"{DD_API_BASE}/admin/duel",
+            headers=headers,
+            json=body,
+            timeout=15,
+        )
+
+        # If 401, try refreshing token once
+        if resp.status_code == 401:
+            dd_get_access_token()
+            headers = dd_auth_headers()
+            resp = http_requests.post(
+                f"{DD_API_BASE}/admin/duel",
+                headers=headers,
+                json=body,
+                timeout=15,
+            )
+
+        resp.raise_for_status()
+        duel = resp.json()
+        logger.info(f"Duel created: {duel.get('id')} — {question}")
+        return duel
+
+    except Exception:
+        logger.exception(f"Failed to create duel: {question}")
+        return None
+
 
 # ── Sorsa API ─────────────────────────────────────────────────────
 
@@ -86,7 +207,6 @@ def fetch_recent_tweets(username: str, max_tweets: int = 20) -> tuple[list[dict]
         if not tweets_raw:
             return None, ""
 
-        # Avatar from first tweet's user object
         avatar = tweets_raw[0].get("user", {}).get("profile_image_url", "")
         if avatar:
             avatar = avatar.replace("_normal.", "_400x400.")
@@ -101,7 +221,6 @@ def fetch_recent_tweets(username: str, max_tweets: int = 20) -> tuple[list[dict]
                 "%a %b %d %H:%M:%S %z %Y",
                 "%Y-%m-%dT%H:%M:%S.%fZ",
                 "%Y-%m-%dT%H:%M:%SZ",
-                "%Y-%m-%d %H:%M:%S",
             ):
                 try:
                     tweet_dt = datetime.strptime(date_str, fmt)
@@ -143,28 +262,6 @@ def extract_handle(text: str) -> str | None:
     return None
 
 
-def build_duel_url(question: str, image_url: str = "") -> str:
-    """Build create-duel URL with all required params."""
-    deadline = datetime.now(timezone.utc) + timedelta(hours=DUEL_DEADLINE_HOURS)
-    deadline_iso = deadline.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    params = {
-        "symbol": DUEL_SYMBOL,
-        "topic": "custom",
-        "question": question,
-        "deadline": deadline_iso,
-        "duel_price": DUEL_PRICE,
-        "commission": DUEL_COMMISSION,
-        "is_owner_resolving": "false",
-        "answer": 0,
-        "event_date": deadline_iso,
-    }
-    if image_url:
-        params["image_url"] = image_url
-
-    return f"{DUEL_BASE_URL}?{urlencode(params)}"
-
-
 def format_tweets_for_prompt(username: str, tweets: list[dict]) -> str:
     lines = [f"Latest tweets from @{username} (last 2 days):\n"]
     for i, t in enumerate(tweets, 1):
@@ -202,7 +299,7 @@ async def received_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🔍 Завантажую твіти @{handle} за останні 2 дні..."
     )
 
-    # ── Fetch tweets + avatar (one API call) ──────────────────────
+    # ── Fetch tweets + avatar ─────────────────────────────────────
     tweets, avatar_url = fetch_recent_tweets(handle)
     if not tweets:
         await status.edit_text(
@@ -214,6 +311,11 @@ async def received_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await status.edit_text(
         f"🎯 {len(tweets)} твітів знайдено. Генерую дуелі..."
     )
+
+    # ── Upload avatar to DuelDuck ─────────────────────────────────
+    logo_url = ""
+    if avatar_url:
+        logo_url = dd_upload_avatar(avatar_url) or ""
 
     # ── Generate duels via Claude Haiku ───────────────────────────
     tweet_context = format_tweets_for_prompt(handle, tweets)
@@ -246,31 +348,37 @@ async def received_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("❌ Ідей не згенеровано. /duel")
             return ConversationHandler.END
 
-        # ── Send results ──────────────────────────────────────────
-        deadline_display = (
-            datetime.now(timezone.utc) + timedelta(hours=DUEL_DEADLINE_HOURS)
-        ).strftime("%H:%M UTC")
-
+        # ── Create duels via API ──────────────────────────────────
         await status.edit_text(
-            f"🦆 *Дуелі для @{handle}*\n"
-            f"💰 {DUEL_PRICE} {DUEL_SYMBOL} · ⏰ дедлайн ~{deadline_display}",
-            parse_mode="Markdown",
+            f"🚀 Створюю {len(ideas)} дуелей на DuelDuck..."
         )
 
+        created_count = 0
         for idea in ideas:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"🎯 Create Duel ({DUEL_PRICE} {DUEL_SYMBOL})",
-                    url=build_duel_url(idea["duel"], avatar_url),
-                )
-            ]])
-            await update.message.reply_text(
-                f"*{idea['duel']}*\n_{idea.get('context', '')}_",
-                parse_mode="Markdown",
-                reply_markup=keyboard,
-            )
+            duel = dd_create_duel(idea["duel"], logo_url)
+            if duel:
+                created_count += 1
+                duel_id = duel.get("id", "")
+                slug = duel.get("slug", "")
+                duel_link = f"{DD_SITE_BASE}/duel/{slug or duel_id}"
 
-        await update.message.reply_text("Ще дуелі? /duel 🦆")
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🎯 Open Duel", url=duel_link)
+                ]])
+                await update.message.reply_text(
+                    f"✅ *{idea['duel']}*\n_{idea.get('context', '')}_",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Не вдалось створити: _{idea['duel']}_",
+                    parse_mode="Markdown",
+                )
+
+        await update.message.reply_text(
+            f"🦆 Створено {created_count}/{len(ideas)} дуелей! /duel для ще"
+        )
 
     except json.JSONDecodeError:
         logger.exception("JSON parse error")
@@ -290,6 +398,9 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Main ──────────────────────────────────────────────────────────
 
 def main():
+    # Pre-authenticate on startup
+    dd_get_access_token()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     conv = ConversationHandler(
@@ -304,7 +415,7 @@ def main():
     )
 
     app.add_handler(conv)
-    logger.info("Bot started (v2 — Sorsa API, 2 USDC, +10h deadline)")
+    logger.info("Bot started (v3 — Full API, auto-create duels)")
     app.run_polling()
 
 
