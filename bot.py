@@ -155,7 +155,7 @@ def build_duel_url(question: str, image_url: str = "") -> str:
         "deadline": deadline_iso,
         "duel_price": DUEL_PRICE,
         "commission": DUEL_COMMISSION,
-        "is_owner_resolving": "true",
+        "is_owner_resolving": "false",
         "answer": 0,
         "event_date": deadline_iso,
     }
